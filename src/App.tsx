@@ -1,15 +1,24 @@
-import { Canvas, useThree } from "@react-three/fiber";
+import { Canvas, useThree, useFrame } from "@react-three/fiber";
 import { SplatMesh } from "./components/spark/SplatMesh";
 import { SparkRenderer } from "./components/spark/SparkRenderer";
 import { CameraControls } from "@react-three/drei";
+import type CameraControlsImpl from "camera-controls";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import * as THREE from "three";
 import { dyno } from "@sparkjsdev/spark";
 import type { SplatMesh as SparkSplatMesh } from "@sparkjsdev/spark";
 
-// ── Hyperparameters ───────────────────────────────────────────────────
+// Hyperparameters
 const BETA_INIT = 0.003;
 const BETA_MAX = 0.2;
+// Volumetric fog: coarse grid of Gaussians centered on model
+const FOG_GRID_X = 10;
+const FOG_GRID_Y = 8;
+const FOG_GRID_Z = 10;
+const FOG_BOX_XZ = 14;
+const FOG_BOX_Y_HALF = 10;
+const FOG_SCALE = 2.8;
+const FOG_SEED = 43;
 const SNOW_COUNT_MAX = 15000;
 const SNOW_COUNT_INIT = 6000;
 const SNOW_SEED = 42;
@@ -45,7 +54,10 @@ function App() {
 
   return (
     <div className="relative flex h-screen w-screen">
-      <Canvas gl={{ antialias: false }}>
+      <Canvas
+        gl={{ antialias: false }}
+        camera={{ position: [0, 2, 8], fov: 50 }}
+      >
         <Scene beta={beta} snowCount={snowCount} debugMode={debugMode} />
       </Canvas>
       {/* Sliders overlay */}
@@ -54,7 +66,7 @@ function App() {
         style={{ fontFamily: "system-ui, sans-serif" }}
       >
         <label className="mb-1.5 block">
-          fog density (beta):
+          extinction β (fog density):
           <input
             type="range"
             min={0}
@@ -65,10 +77,10 @@ function App() {
             className="ml-2 align-middle"
             style={{ width: 220 }}
           />{" "}
-          <span>{beta.toFixed(4)}</span>
+          <span>{beta.toFixed(4)}</span> 1/m
         </label>
         <label className="mb-1.5 block">
-          snowfall density:
+          particle count (snow flakes):
           <input
             type="range"
             min={0}
@@ -91,26 +103,13 @@ function App() {
           />
           <span>debug: color by T (blue=high, red=low)</span>
         </label>
-        <div className="mt-2 border-t border-white/20 pt-2 text-[0.8em] opacity-80">
-          <div className="mb-0.5 font-medium">
-            Transmittance T(d) = exp(−βd)
-          </div>
-          <div className="mb-0.5">
-            T(5) = <span>{Math.exp(-beta * 5).toFixed(3)}</span>
-            {" · "}
-            T(20) = <span>{Math.exp(-beta * 20).toFixed(3)}</span>
-          </div>
-          <div className="mb-0.5 font-medium">
-            Absorption = 1 − T(d)
-          </div>
-          <div>
-            1−T(5) = <span>{(1 - Math.exp(-beta * 5)).toFixed(3)}</span>
-            {" · "}
-            1−T(20) = <span>{(1 - Math.exp(-beta * 20)).toFixed(3)}</span>
-          </div>
+        <div className="mt-2 border-t border-white/20 pt-2 text-[0.78em] opacity-80">
+          Beer–Lambert law: T(d) = exp(−β d). At 5m:{" "}
+          <span>{Math.exp(-beta * 5).toFixed(3)}</span>, at 20m:{" "}
+          <span>{Math.exp(-beta * 20).toFixed(3)}</span>
         </div>
         <div className="mt-1.5 text-[0.82em] opacity-75">
-          WASD / arrows · mouse to look
+          WASD orbit/zoom · arrows pan & rotate · mouse drag to look
         </div>
       </div>
     </div>
@@ -123,16 +122,77 @@ type SceneProps = {
   debugMode: boolean;
 };
 
+const FOG_COUNT = FOG_GRID_X * FOG_GRID_Y * FOG_GRID_Z;
+
+const DOLLY_SPEED = 3;
+const ROTATE_SPEED = 45;
+const ORBIT_ORIGIN = { x: 0, y: 0, z: 0 };
+
+function KeyboardHandler({
+  controlsRef,
+}: {
+  controlsRef: React.RefObject<CameraControlsImpl | null>;
+}) {
+  const keys = useRef<Record<string, boolean>>({});
+  const deg = Math.PI / 180;
+  useFrame((_, delta) => {
+    const ctrl = controlsRef.current;
+    if (!ctrl) return;
+    const dt = delta;
+    // W/S: dolly in/out (zoom toward/away from orbit origin)
+    if (keys.current["KeyW"]) ctrl.dolly(DOLLY_SPEED * dt, false);
+    if (keys.current["KeyS"]) ctrl.dolly(-DOLLY_SPEED * dt, false);
+    // A/D: orbit left/right (azimuth)
+    if (keys.current["KeyA"])
+      ctrl.rotate(-ROTATE_SPEED * dt * deg, 0, false);
+    if (keys.current["KeyD"])
+      ctrl.rotate(ROTATE_SPEED * dt * deg, 0, false);
+    // Arrows: orbit left/right, pan up/down (polar)
+    if (keys.current["ArrowLeft"])
+      ctrl.rotate(-ROTATE_SPEED * dt * deg, 0, false);
+    if (keys.current["ArrowRight"])
+      ctrl.rotate(ROTATE_SPEED * dt * deg, 0, false);
+    if (keys.current["ArrowUp"])
+      ctrl.rotate(0, -ROTATE_SPEED * dt * deg, false);
+    if (keys.current["ArrowDown"])
+      ctrl.rotate(0, ROTATE_SPEED * dt * deg, false);
+  });
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      keys.current[e.code] = true;
+    };
+    const onKeyUp = (e: KeyboardEvent) => {
+      keys.current[e.code] = false;
+    };
+    window.addEventListener("keydown", onKeyDown);
+    window.addEventListener("keyup", onKeyUp);
+    return () => {
+      window.removeEventListener("keydown", onKeyDown);
+      window.removeEventListener("keyup", onKeyUp);
+    };
+  }, []);
+  return null;
+}
+
 const Scene = ({ beta, snowCount, debugMode }: SceneProps) => {
   const renderer = useThree((state) => state.gl);
   const camera = useThree((state) => state.camera);
   const scene = useThree((state) => state.scene);
+  const controlsRef = useRef<CameraControlsImpl | null>(null);
+  const hasInitializedCamera = useRef(false);
   const meshRef = useRef<SparkSplatMesh>(null);
   const snowMeshRef = useRef<SparkSplatMesh>(null);
+  const fogMeshRef = useRef<SparkSplatMesh>(null);
   const snowCountRef = useRef(snowCount);
   const betaRef = useRef(beta);
   snowCountRef.current = snowCount;
   betaRef.current = beta;
+
+  // Volumetric fog opacity: map β to mesh opacity
+  useEffect(() => {
+    const fog = fogMeshRef.current;
+    if (fog) fog.opacity = Math.min(1, beta * 12);
+  }, [beta]);
 
   // Force fog generators to re-run when beta or debugMode changes
   useEffect(() => {
@@ -178,7 +238,7 @@ const Scene = ({ beta, snowCount, debugMode }: SceneProps) => {
           // debug: blue = high T, red = low T
           const debugRgb = dyno.mix(colorRed, colorBlue, T);
           const newRgb = dyno.select(uDebugMode, debugRgb, normalRgb);
-          // alpha: same idea but respecting existing opacity
+          // alpha: respecting existing opacity
           const newAlpha = dyno.sub(
             one,
             dyno.mul(T, dyno.sub(one, opacity)),
@@ -195,6 +255,40 @@ const Scene = ({ beta, snowCount, debugMode }: SceneProps) => {
     },
     [fogUniforms],
   );
+
+  // Pre-compute volumetric fog data (once): fixed grid centered on model
+  const fogData = useMemo(() => {
+    const rng = makeRNG(FOG_SEED);
+    const fogPos = new Float32Array(FOG_COUNT * 3);
+    const fogScl = new Float32Array(FOG_COUNT * 3);
+    const fogQuat = new Float32Array(FOG_COUNT * 4);
+    for (let i = 0; i < FOG_COUNT; i++) {
+      const ix = i % FOG_GRID_X;
+      const iy = Math.floor(i / FOG_GRID_X) % FOG_GRID_Y;
+      const iz = Math.floor(i / (FOG_GRID_X * FOG_GRID_Y));
+      const ux = FOG_GRID_X > 1 ? ix / (FOG_GRID_X - 1) : 0.5;
+      const uy = FOG_GRID_Y > 1 ? iy / (FOG_GRID_Y - 1) : 0.5;
+      const uz = FOG_GRID_Z > 1 ? iz / (FOG_GRID_Z - 1) : 0.5;
+      fogPos[i * 3 + 0] = (ux - 0.5) * 2 * FOG_BOX_XZ + (rng() - 0.5) * 0.5;
+      fogPos[i * 3 + 1] =
+        (uy - 0.5) * 2 * FOG_BOX_Y_HALF + (rng() - 0.5) * 0.3;
+      fogPos[i * 3 + 2] = (uz - 0.5) * 2 * FOG_BOX_XZ + (rng() - 0.5) * 0.5;
+      const s = FOG_SCALE * (0.9 + rng() * 0.2);
+      fogScl[i * 3 + 0] = s;
+      fogScl[i * 3 + 1] = s;
+      fogScl[i * 3 + 2] = s;
+      const u1 = rng();
+      const u2 = rng() * Math.PI * 2;
+      const u3 = rng() * Math.PI * 2;
+      const sq1 = Math.sqrt(1 - u1);
+      const squ1 = Math.sqrt(u1);
+      fogQuat[i * 4 + 0] = sq1 * Math.sin(u2);
+      fogQuat[i * 4 + 1] = sq1 * Math.cos(u2);
+      fogQuat[i * 4 + 2] = squ1 * Math.sin(u3);
+      fogQuat[i * 4 + 3] = squ1 * Math.cos(u3);
+    }
+    return { fogPos, fogScl, fogQuat };
+  }, []);
 
   // Pre-compute snow data (once)
   const snowData = useMemo(() => {
@@ -416,14 +510,70 @@ const Scene = ({ beta, snowCount, debugMode }: SceneProps) => {
     );
   }, [scene]);
 
+  const fogMeshArgs = useMemo(() => {
+    const _sc = new THREE.Vector3();
+    const _ss = new THREE.Vector3();
+    const _sq = new THREE.Quaternion();
+    const _scol = new THREE.Color(
+      FOG_COLOR.x,
+      FOG_COLOR.y,
+      FOG_COLOR.z,
+    );
+    const { fogPos, fogScl, fogQuat } = fogData;
+    return {
+      maxSplats: FOG_COUNT,
+      constructSplats: (ps: {
+        ensureSplats: (n: number) => void;
+        pushSplat: (
+          c: THREE.Vector3,
+          s: THREE.Vector3,
+          q: THREE.Quaternion,
+          o: number,
+          col: THREE.Color
+        ) => void;
+      }) => {
+        ps.ensureSplats(FOG_COUNT);
+        for (let i = 0; i < FOG_COUNT; i++) {
+          _sc.set(fogPos[i * 3], fogPos[i * 3 + 1], fogPos[i * 3 + 2]);
+          _ss.set(fogScl[i * 3], fogScl[i * 3 + 1], fogScl[i * 3 + 2]);
+          _sq.set(
+            fogQuat[i * 4],
+            fogQuat[i * 4 + 1],
+            fogQuat[i * 4 + 2],
+            fogQuat[i * 4 + 3],
+          );
+          ps.pushSplat(_sc, _ss, _sq, 0.08, _scol);
+        }
+      },
+      onLoad: (mesh: SparkSplatMesh) => {
+        mesh.opacity = Math.min(1, betaRef.current * 12);
+      },
+    } as const;
+  }, [fogData]);
+
   return (
     <>
-      <CameraControls />
+      <KeyboardHandler controlsRef={controlsRef} />
+      <CameraControls
+        ref={(c) => {
+          controlsRef.current = c ?? null;
+          if (c && !hasInitializedCamera.current) {
+            hasInitializedCamera.current = true;
+            // Orbit around origin: camera in front, looking at (0,0,0)
+            c.setLookAt(
+              0, 2, 8,
+              ORBIT_ORIGIN.x, ORBIT_ORIGIN.y, ORBIT_ORIGIN.z,
+              false
+            );
+          }
+        }}
+      />
       <SparkRenderer args={[sparkRendererArgs]}>
         <group rotation={[0, 0, 0]}>
           <SplatMesh ref={meshRef} args={[splatMeshArgs]} />
         </group>
         <SplatMesh ref={snowMeshRef} args={[snowMeshArgs]} />
+        <SplatMesh ref={fogMeshRef} args={[fogMeshArgs]} />
       </SparkRenderer>
     </>
   );
