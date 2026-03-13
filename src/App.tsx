@@ -82,6 +82,24 @@ function App() {
           />{" "}
           <span>{snowCount}</span> flakes
         </label>
+        <div className="mt-2 border-t border-white/20 pt-2 text-[0.8em] opacity-80">
+          <div className="mb-0.5 font-medium">
+            Transmittance T(d) = exp(−βd)
+          </div>
+          <div className="mb-0.5">
+            T(5) = <span>{Math.exp(-beta * 5).toFixed(3)}</span>
+            {" · "}
+            T(20) = <span>{Math.exp(-beta * 20).toFixed(3)}</span>
+          </div>
+          <div className="mb-0.5 font-medium">
+            Absorption = 1 − T(d)
+          </div>
+          <div>
+            1−T(5) = <span>{(1 - Math.exp(-beta * 5)).toFixed(3)}</span>
+            {" · "}
+            1−T(20) = <span>{(1 - Math.exp(-beta * 20)).toFixed(3)}</span>
+          </div>
+        </div>
         <div className="mt-1.5 text-[0.82em] opacity-75">
           WASD / arrows · mouse to look
         </div>
@@ -134,7 +152,14 @@ const Scene = ({ beta, snowCount }: SceneProps) => {
           const dist = dyno.distance(center, camPos);
           const T = dyno.exp(dyno.neg(dyno.mul(uBeta, dist)));
           const one = dyno.dynoConst("float", 1.0);
-          const newRgb = dyno.mix(uFogColor, rgb, T);
+          // absorption = (1 - T)
+          const absorption = dyno.sub(one, T);
+          // color: C_fog + C_splat = (1-T)·c_fog + T·c_splat
+          const newRgb = dyno.add(
+            dyno.mul(uFogColor, absorption),
+            dyno.mul(rgb, T),
+          );
+          // alpha: same idea but respecting existing opacity
           const newAlpha = dyno.sub(
             one,
             dyno.mul(T, dyno.sub(one, opacity)),
