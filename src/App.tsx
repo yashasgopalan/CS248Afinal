@@ -130,7 +130,9 @@ const Scene = ({ beta, snowCount, debugMode }: SceneProps) => {
   const meshRef = useRef<SparkSplatMesh>(null);
   const snowMeshRef = useRef<SparkSplatMesh>(null);
   const snowCountRef = useRef(snowCount);
+  const betaRef = useRef(beta);
   snowCountRef.current = snowCount;
+  betaRef.current = beta;
 
   // Force fog generators to re-run when beta or debugMode changes
   useEffect(() => {
@@ -343,6 +345,7 @@ const Scene = ({ beta, snowCount, debugMode }: SceneProps) => {
         const cx = camera.position.x;
         const cy = camera.position.y;
         const cz = camera.position.z;
+        const beta = betaRef.current;
         const yMin = cy - SNOW_BOX_Y_BELOW;
         const yMax = cy + SNOW_BOX_Y_ABOVE;
         const xMin = cx - SNOW_BOX_XZ;
@@ -376,6 +379,12 @@ const Scene = ({ beta, snowCount, debugMode }: SceneProps) => {
           snowPos[i * 3 + 0] = px;
           snowPos[i * 3 + 1] = py;
           snowPos[i * 3 + 2] = pz;
+          const dx = px - cx;
+          const dy = py - cy;
+          const dz = pz - cz;
+          const d = Math.sqrt(dx * dx + dy * dy + dz * dz);
+          const T = Math.exp(-beta * d);
+          const alpha = snowOpac[i] * T;
           _sc.set(px, py, pz);
           _ss.set(snowScl[i * 3], snowScl[i * 3 + 1], snowScl[i * 3 + 2]);
           _sq.set(
@@ -384,8 +393,12 @@ const Scene = ({ beta, snowCount, debugMode }: SceneProps) => {
             snowQuat[i * 4 + 2],
             snowQuat[i * 4 + 3],
           );
-          _scol.setRGB(snowColR[i], snowColG[i], snowColB[i]);
-          mesh.packedSplats.setSplat(i, _sc, _ss, _sq, snowOpac[i], _scol);
+          _scol.setRGB(
+            snowColR[i] * T + FOG_COLOR.x * (1 - T),
+            snowColG[i] * T + FOG_COLOR.y * (1 - T),
+            snowColB[i] * T + FOG_COLOR.z * (1 - T),
+          );
+          mesh.packedSplats.setSplat(i, _sc, _ss, _sq, alpha, _scol);
         }
         mesh.packedSplats.numSplats = activeSnowCount;
         mesh.numSplats = activeSnowCount;
