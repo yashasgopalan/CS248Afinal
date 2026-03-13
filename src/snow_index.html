@@ -1,0 +1,354 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Spark — Volumetric Fog + Snow</title>
+  <style>
+    html, body { margin: 0; height: 100%; overflow: hidden; }
+    #ui {
+      position: fixed; top: 12px; left: 12px; z-index: 10;
+      background: rgba(0,0,0,0.55); color: white;
+      padding: 10px 14px; border-radius: 10px; font-family: sans-serif;
+      min-width: 270px;
+    }
+    #ui label { display: block; margin-bottom: 6px; }
+    #ui input[type=range] { width: 220px; vertical-align: middle; }
+    #ui .hint { font-size: 0.82em; opacity: 0.75; margin-top: 6px; }
+  </style>
+
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://cdnjs.cloudflare.com/ajax/libs/three.js/0.178.0/three.module.js",
+      "@sparkjsdev/spark": "https://sparkjs.dev/releases/spark/0.1.10/spark.module.js"
+    }
+  }
+  </script>
+</head>
+<body>
+  <div id="ui">
+    <label>
+      fog density (beta):
+      <input id="betaSlider" type="range"> <span id="betaVal"></span>
+    </label>
+    <label>
+      snowfall density:
+      <input id="snowSlider" type="range"> <span id="snowVal"></span> flakes
+    </label>
+    <div class="hint">WASD / arrows · mouse to look</div>
+  </div>
+
+  <script type="module">
+    import * as THREE from "three";
+    import { SplatMesh, SparkRenderer, SparkControls, dyno } from "@sparkjsdev/spark";
+
+    // ╔════════════════════════════════════════════════════════════════╗
+    // ║                      HYPERPARAMETERS                          ║
+    // ╠════════════════════════════════════════════════════════════════╣
+
+    // ── Scene ────────────────────────────────────────────────────────
+    const SPLAT_FILE    = "./project-modern-house-with-lush-landscaping.spz"; // ← scene file
+    const CAM_START     = new THREE.Vector3(0, 0, 0);       // ← initial camera pos
+
+    // ── Fog ──────────────────────────────────────────────────────────
+    const FOG_COLOR     = new THREE.Vector3(1.0, 1.0, 1.0);   // ← fog/sky RGB (0–1)
+    //  warm day:  new THREE.Vector3(1.0, 0.95, 0.85)
+    //  grey sky:  new THREE.Vector3(0.75, 0.78, 0.82)
+    const BETA_INIT     = 0.003;   // ← starting fog density
+    const BETA_MAX      = 0.2;    // ← slider maximum
+
+    // ── Snow appearance ───────────────────────────────────────────────
+    const SNOW_COLOR        = [0.95, 0, 0]; // ← base RGB per flake (0–1 each)
+    const SNOW_COLOR_JITTER = 0.02;   // ← ±per-channel random variation (0 = identical)
+    const SNOW_ALPHA_MIN    = 0.70;   // ← opacity range (0–1)
+    const SNOW_ALPHA_MAX    = 0.90;
+    const SNOW_SCALE_MIN    = 0.010;   // ← size range in scene units
+    const SNOW_SCALE_MAX    = 0.035;
+    const SNOW_ELONGATION   = 0.85;   // ← Z-scale multiplier: <1 = flat disk, 1 = sphere
+
+    // ── Snow volume (camera-relative box) ────────────────────────────
+    const SNOW_BOX_XZ       = 10;    // ← half-width in X and Z around camera
+    const SNOW_BOX_Y_ABOVE  = 10;    // ← spawn this far above camera Y
+    const SNOW_BOX_Y_BELOW  = 5;     // ← recycle when flake falls this far below camera Y
+
+    // ── Snow animation ────────────────────────────────────────────────
+    const SNOW_FALL_SPEED   = 1.50;   // ← units/second downward
+    const SNOW_DRIFT_SPEED  = 1.5;    // ← units/second max horizontal oscillation
+    const SNOW_DRIFT_FREQ   = 0.25;   // ← drift oscillation frequency (lower = slower sway)
+
+    // ── Snow count ────────────────────────────────────────────────────
+    const SNOW_COUNT_MAX    = 15000;  // ← max flakes (slider upper bound)
+    const SNOW_COUNT_INIT   = 6000;   // ← flakes active at page load
+    const SNOW_SEED         = 42;     // ← seed for reproducible initial positions/shapes
+
+    // ╚════════════════════════════════════════════════════════════════╝
+
+    // ── Wire sliders from hyperparameters ─────────────────────────────
+    const betaSlider = document.getElementById("betaSlider");
+    const betaVal    = document.getElementById("betaVal");
+    betaSlider.min = 0; betaSlider.max = BETA_MAX;
+    betaSlider.step = BETA_MAX / 200;
+    betaSlider.value = BETA_INIT;
+    betaVal.textContent = BETA_INIT.toFixed(4);
+
+    const snowSlider = document.getElementById("snowSlider");
+    const snowVal    = document.getElementById("snowVal");
+    snowSlider.min = 0; snowSlider.max = SNOW_COUNT_MAX;
+    snowSlider.step = 100;
+    snowSlider.value = SNOW_COUNT_INIT;
+    snowVal.textContent = SNOW_COUNT_INIT;
+
+    // ── Scene ──────────────────────────────────────────────────────────
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(FOG_COLOR.x, FOG_COLOR.y, FOG_COLOR.z);
+
+    const camera = new THREE.PerspectiveCamera(
+      60, window.innerWidth / window.innerHeight, 0.05, 2000
+    );
+    camera.position.copy(CAM_START);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: false, preserveDrawingBuffer: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    document.body.appendChild(renderer.domElement);
+
+    const spark = new SparkRenderer({ renderer });
+    scene.add(spark);
+
+    // ── Shared fog dyno uniforms ───────────────────────────────────────
+    const uBeta     = dyno.dynoFloat(BETA_INIT);
+    const uFogColor = dyno.dynoVec3(FOG_COLOR.clone());
+
+    // ── Factory: builds a volumetric fog worldModifier for any SplatMesh.
+    //    Uses that mesh's own context.viewToWorld.translate so SparkJS
+    //    auto-tracks camera movement and re-runs the generator on move.
+    function makeFogModifier(mesh) {
+      mesh.enableViewToWorld = true;
+      const camPos = mesh.context.viewToWorld.translate; // DynoVec3, auto-updated
+      return dyno.dynoBlock(
+        { gsplat: dyno.Gsplat },
+        { gsplat: dyno.Gsplat },
+        ({ gsplat }) => {
+          if (!gsplat) return { gsplat };
+          const { center, rgb, opacity } = dyno.splitGsplat(gsplat).outputs;
+          // T(d) = exp(-beta * d) — transmittance through the fog column
+          const dist = dyno.distance(center, camPos);
+          const T    = dyno.exp(dyno.neg(dyno.mul(uBeta, dist)));
+          const one  = dyno.dynoConst("float", 1.0);
+          // Full volumetric color:  mix(fog_color, splat_rgb, T)
+          const newRgb   = dyno.mix(uFogColor, rgb, T);
+          // Full volumetric alpha:  1 - T*(1 - splat_alpha)
+          const newAlpha = dyno.sub(one, dyno.mul(T, dyno.sub(one, opacity)));
+          return { gsplat: dyno.combineGsplat({ gsplat, rgb: newRgb, opacity: newAlpha }) };
+        }
+      );
+    }
+
+    // ── Scene splats ───────────────────────────────────────────────────
+    const splats = new SplatMesh({
+      url: SPLAT_FILE,
+      lod: true,
+      onLoad: () => {
+        splats.worldModifier = makeFogModifier(splats);
+        splats.updateGenerator();
+      }
+    });
+    scene.add(splats);
+
+    // ══════════════════════════════════════════════════════════════════
+    //  SNOW SYSTEM
+    // ══════════════════════════════════════════════════════════════════
+
+    // ── Seeded deterministic RNG (xorshift32) ─────────────────────────
+    function makeRNG(seed) {
+      let s = (seed | 0) || 1;
+      return () => {
+        s ^= s << 13; s ^= s >> 17; s ^= s << 5;
+        return (s >>> 0) / 4294967296;
+      };
+    }
+
+    // ── Pre-compute all per-flake data at startup (once, seeded) ──────
+    const rng = makeRNG(SNOW_SEED);
+
+    const snowPos   = new Float32Array(SNOW_COUNT_MAX * 3); // [x,y,z] per flake
+    const snowPhase = new Float32Array(SNOW_COUNT_MAX);     // drift phase offset
+    const snowScl   = new Float32Array(SNOW_COUNT_MAX * 3); // [sx,sy,sz] fixed per flake
+    const snowQuat  = new Float32Array(SNOW_COUNT_MAX * 4); // [x,y,z,w] fixed per flake
+    const snowOpac  = new Float32Array(SNOW_COUNT_MAX);     // fixed opacity per flake
+    const snowColR  = new Float32Array(SNOW_COUNT_MAX);     // fixed per-flake RGB
+    const snowColG  = new Float32Array(SNOW_COUNT_MAX);
+    const snowColB  = new Float32Array(SNOW_COUNT_MAX);
+
+    const cx0 = camera.position.x, cy0 = camera.position.y, cz0 = camera.position.z;
+    for (let i = 0; i < SNOW_COUNT_MAX; i++) {
+      // Scatter flakes randomly inside the camera-relative spawn box
+      snowPos[i*3+0] = cx0 + (rng() - 0.5) * 2 * SNOW_BOX_XZ;
+      snowPos[i*3+1] = cy0 - SNOW_BOX_Y_BELOW + rng() * (SNOW_BOX_Y_ABOVE + SNOW_BOX_Y_BELOW);
+      snowPos[i*3+2] = cz0 + (rng() - 0.5) * 2 * SNOW_BOX_XZ;
+
+      snowPhase[i] = rng() * Math.PI * 2;
+
+      // Scales: isotropic XY, thin Z (flat disk)
+      const s = SNOW_SCALE_MIN + rng() * (SNOW_SCALE_MAX - SNOW_SCALE_MIN);
+      snowScl[i*3+0] = s;
+      snowScl[i*3+1] = s;
+      snowScl[i*3+2] = s * SNOW_ELONGATION;
+
+      // Uniformly distributed random unit quaternion (Shoemake's method)
+      const u1 = rng();
+      const u2 = rng() * Math.PI * 2;
+      const u3 = rng() * Math.PI * 2;
+      const sq1 = Math.sqrt(1 - u1), squ1 = Math.sqrt(u1);
+      snowQuat[i*4+0] = sq1  * Math.sin(u2); // x
+      snowQuat[i*4+1] = sq1  * Math.cos(u2); // y
+      snowQuat[i*4+2] = squ1 * Math.sin(u3); // z
+      snowQuat[i*4+3] = squ1 * Math.cos(u3); // w
+
+      snowOpac[i] = SNOW_ALPHA_MIN + rng() * (SNOW_ALPHA_MAX - SNOW_ALPHA_MIN);
+
+      // Slight per-flake color jitter so all flakes aren't identical
+      snowColR[i] = Math.min(1, Math.max(0, SNOW_COLOR[0] + (rng() - 0.5) * 2 * SNOW_COLOR_JITTER));
+      snowColG[i] = Math.min(1, Math.max(0, SNOW_COLOR[1] + (rng() - 0.5) * 2 * SNOW_COLOR_JITTER));
+      snowColB[i] = Math.min(1, Math.max(0, SNOW_COLOR[2] + (rng() - 0.5) * 2 * SNOW_COLOR_JITTER));
+    }
+
+    // Reusable THREE.js objects for onFrame hot loop — avoids GC pressure
+    const _sc   = new THREE.Vector3();
+    const _ss   = new THREE.Vector3();
+    const _sq   = new THREE.Quaternion();
+    const _scol = new THREE.Color();
+
+    let activeSnowCount = SNOW_COUNT_INIT;
+
+    // ── Snow SplatMesh ─────────────────────────────────────────────────
+    const snowSplats = new SplatMesh({
+      maxSplats: SNOW_COUNT_MAX,
+
+      // constructSplats runs once at startup: fill all SNOW_COUNT_MAX slots
+      // so the buffer is fully pre-allocated and setSplat never needs to resize.
+      constructSplats: (ps) => {
+        ps.ensureSplats(SNOW_COUNT_MAX); // single allocation up front
+        for (let i = 0; i < SNOW_COUNT_MAX; i++) {
+          _sc.set(snowPos[i*3], snowPos[i*3+1], snowPos[i*3+2]);
+          _ss.set(snowScl[i*3], snowScl[i*3+1], snowScl[i*3+2]);
+          _sq.set(snowQuat[i*4], snowQuat[i*4+1], snowQuat[i*4+2], snowQuat[i*4+3]);
+          _scol.setRGB(snowColR[i], snowColG[i], snowColB[i]);
+          ps.pushSplat(_sc, _ss, _sq, snowOpac[i], _scol);
+        }
+      },
+
+      // onLoad: attach the same volumetric fog to snow so distant flakes
+      // fade into the fog color — physically consistent with the scene.
+      onLoad: () => {
+        snowSplats.worldModifier = makeFogModifier(snowSplats);
+        snowSplats.updateGenerator();
+      },
+
+      // onFrame: runs every rendered frame.  Updates flake positions in JS,
+      // pushes the new CPU data to the GPU texture, and triggers generator.
+      onFrame: ({ mesh, time, deltaTime }) => {
+        // If slider is at zero, hide all snow cleanly
+        if (activeSnowCount === 0) {
+          if (mesh.numSplats !== 0) {
+            mesh.packedSplats.numSplats = 0;
+            mesh.numSplats = 0;
+            mesh.packedSplats.needsUpdate = true;
+            mesh.updateVersion();
+          }
+          return;
+        }
+
+        // Cap dt so a tab-switch or lag spike doesn't teleport all flakes
+        const dt = Math.min(deltaTime, 0.05);
+
+        const cx = camera.position.x;
+        const cy = camera.position.y;
+        const cz = camera.position.z;
+        // Camera-relative recycle bounds
+        const yMin = cy - SNOW_BOX_Y_BELOW;
+        const yMax = cy + SNOW_BOX_Y_ABOVE;
+        const xMin = cx - SNOW_BOX_XZ;
+        const xMax = cx + SNOW_BOX_XZ;
+        const zMin = cz - SNOW_BOX_XZ;
+        const zMax = cz + SNOW_BOX_XZ;
+
+        for (let i = 0; i < activeSnowCount; i++) {
+          let px = snowPos[i*3+0];
+          let py = snowPos[i*3+1];
+          let pz = snowPos[i*3+2];
+
+          // ── Gravity ────────────────────────────────────────────────
+          py -= SNOW_FALL_SPEED * dt;
+
+          // ── Wind drift (independent oscillation per flake) ─────────
+          const ph = snowPhase[i];
+          px += Math.sin(time * SNOW_DRIFT_FREQ + ph)        * SNOW_DRIFT_SPEED * dt;
+          pz += Math.cos(time * SNOW_DRIFT_FREQ + ph * 1.37) * SNOW_DRIFT_SPEED * dt;
+
+          // ── Recycle: if flake exits the camera-relative box, ───────
+          //    teleport it to the top of the box with new random XZ.
+          //    Flakes always re-enter from above, never appear from below.
+          if (py < yMin || px < xMin || px > xMax || pz < zMin || pz > zMax) {
+            py = yMax;
+            px = cx + (Math.random() - 0.5) * 2 * SNOW_BOX_XZ;
+            pz = cz + (Math.random() - 0.5) * 2 * SNOW_BOX_XZ;
+          }
+
+          snowPos[i*3+0] = px;
+          snowPos[i*3+1] = py;
+          snowPos[i*3+2] = pz;
+
+          // Pack updated position; all other per-flake data is fixed.
+          _sc.set(px, py, pz);
+          _ss.set(snowScl[i*3], snowScl[i*3+1], snowScl[i*3+2]);
+          _sq.set(snowQuat[i*4], snowQuat[i*4+1], snowQuat[i*4+2], snowQuat[i*4+3]);
+          _scol.setRGB(snowColR[i], snowColG[i], snowColB[i]);
+
+          mesh.packedSplats.setSplat(i, _sc, _ss, _sq, snowOpac[i], _scol);
+        }
+
+        // Commit: update GPU texture and tell SparkJS to re-run the generator
+        mesh.packedSplats.numSplats = activeSnowCount;
+        mesh.numSplats              = activeSnowCount;
+        mesh.packedSplats.needsUpdate = true;
+        mesh.updateVersion();
+      }
+    });
+    scene.add(snowSplats);
+
+    // ── Controls ───────────────────────────────────────────────────────
+    const controls = new SparkControls({ canvas: renderer.domElement });
+
+    // ── Slider events ──────────────────────────────────────────────────
+    betaSlider.addEventListener("input", () => {
+      uBeta.value = parseFloat(betaSlider.value);
+      betaVal.textContent = uBeta.value.toFixed(4);
+      // Force both scene and snow splats to re-run fog generators immediately
+      splats.updateVersion();
+      snowSplats.updateVersion();
+    });
+
+    snowSlider.addEventListener("input", () => {
+      activeSnowCount = Math.round(parseFloat(snowSlider.value));
+      snowVal.textContent = activeSnowCount;
+      // Trigger immediate re-render so flake count updates without waiting for next frame
+      snowSplats.updateVersion();
+    });
+
+    window.addEventListener("resize", () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+
+    // ── Render loop ────────────────────────────────────────────────────
+    let lastT = performance.now();
+    renderer.setAnimationLoop((t) => {
+      const dt = (t - lastT) / 1000;
+      lastT = t;
+      controls.update(camera, dt);
+      renderer.render(scene, camera);
+    });
+  </script>
+</body>
+</html>
