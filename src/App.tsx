@@ -36,6 +36,24 @@ const SNOW_FALL_SPEED = 1.5;
 const SNOW_DRIFT_SPEED = 1.5;
 const SNOW_DRIFT_FREQ = 0.25;
 const FOG_COLOR = new THREE.Vector3(1, 1, 1);
+// Patchy fog (volumetric mode)
+const PATCH_SCALE_INIT = 3;
+const PATCH_SCALE_MIN = 0.5;
+const PATCH_SCALE_MAX = 12;
+const PATCH_AMOUNT_INIT = 0.5;
+const PATCH_AMOUNT_MAX = 1;
+const NOISE_SEED_INIT = 0;
+// Sun direction & view-dependent extinction (volumetric teaching)
+const SUN_AZIMUTH_INIT = 45; // degrees, 0=+Z, 90=+X
+const SUN_ELEVATION_INIT = 35; // degrees, 0=horizon, 90=zenith
+const SUN_DISTANCE = 20;
+
+function sunDirFromAngles(azimuthDeg: number, elevationDeg: number) {
+  const az = (azimuthDeg * Math.PI) / 180;
+  const el = (elevationDeg * Math.PI) / 180;
+  const c = Math.cos(el);
+  return new THREE.Vector3(c * Math.sin(az), Math.sin(el), c * Math.cos(az));
+}
 
 function makeRNG(seed: number) {
   let s = (seed | 0) || 1;
@@ -51,6 +69,12 @@ function App() {
   const [beta, setBeta] = useState(BETA_INIT);
   const [snowCount, setSnowCount] = useState(SNOW_COUNT_INIT);
   const [debugMode, setDebugMode] = useState(false);
+  const [volumetricMode, setVolumetricMode] = useState(false);
+  const [patchScale, setPatchScale] = useState(PATCH_SCALE_INIT);
+  const [patchAmount, setPatchAmount] = useState(PATCH_AMOUNT_INIT);
+  const [noiseSeed, setNoiseSeed] = useState(NOISE_SEED_INIT);
+  const [sunAzimuth, setSunAzimuth] = useState(SUN_AZIMUTH_INIT);
+  const [sunElevation, setSunElevation] = useState(SUN_ELEVATION_INIT);
 
   return (
     <div className="relative flex h-screen w-screen">
@@ -58,7 +82,17 @@ function App() {
         gl={{ antialias: false }}
         camera={{ position: [0, 2, 8], fov: 50 }}
       >
-        <Scene beta={beta} snowCount={snowCount} debugMode={debugMode} />
+        <Scene
+          beta={beta}
+          snowCount={snowCount}
+          debugMode={debugMode}
+          volumetricMode={volumetricMode}
+          patchScale={patchScale}
+          patchAmount={patchAmount}
+          noiseSeed={noiseSeed}
+          sunAzimuth={sunAzimuth}
+          sunElevation={sunElevation}
+        />
       </Canvas>
       {/* Sliders overlay */}
       <div
@@ -98,15 +132,116 @@ function App() {
         <label className="mb-1.5 flex items-center gap-2">
           <input
             type="checkbox"
+            checked={volumetricMode}
+            onChange={(e) => setVolumetricMode(e.target.checked)}
+          />
+          <span>volumetric transmittance (height + patchy noise)</span>
+        </label>
+        {volumetricMode && (
+          <>
+            <label className="mb-1.5 block">
+              patch scale:
+              <input
+                type="range"
+                min={PATCH_SCALE_MIN}
+                max={PATCH_SCALE_MAX}
+                step={0.5}
+                value={patchScale}
+                onChange={(e) =>
+                  setPatchScale(parseFloat(e.target.value))
+                }
+                className="ml-2 align-middle"
+                style={{ width: 180 }}
+              />{" "}
+              <span>{patchScale.toFixed(1)}</span>
+            </label>
+            <label className="mb-1.5 block">
+              patch amount:
+              <input
+                type="range"
+                min={0}
+                max={PATCH_AMOUNT_MAX}
+                step={0.05}
+                value={patchAmount}
+                onChange={(e) =>
+                  setPatchAmount(parseFloat(e.target.value))
+                }
+                className="ml-2 align-middle"
+                style={{ width: 180 }}
+              />{" "}
+              <span>{patchAmount.toFixed(2)}</span>
+            </label>
+            <label className="mb-1.5 block">
+              noise seed:
+              <input
+                type="range"
+                min={0}
+                max={100}
+                step={1}
+                value={noiseSeed}
+                onChange={(e) =>
+                  setNoiseSeed(parseInt(e.target.value, 10))
+                }
+                className="ml-2 align-middle"
+                style={{ width: 180 }}
+              />{" "}
+              <span>{noiseSeed}</span>
+            </label>
+            <div className="mb-1.5 border-t border-white/30 pt-2">
+              <span className="text-[0.85em] font-medium">Sun & view angle</span>
+            </div>
+            <label className="mb-1.5 block">
+              sun azimuth (°):
+              <input
+                type="range"
+                min={0}
+                max={360}
+                step={5}
+                value={sunAzimuth}
+                onChange={(e) =>
+                  setSunAzimuth(parseFloat(e.target.value))
+                }
+                className="ml-2 align-middle"
+                style={{ width: 180 }}
+              />{" "}
+              <span>{sunAzimuth}</span>
+            </label>
+            <label className="mb-1.5 block">
+              sun elevation (°):
+              <input
+                type="range"
+                min={0}
+                max={90}
+                step={5}
+                value={sunElevation}
+                onChange={(e) =>
+                  setSunElevation(parseFloat(e.target.value))
+                }
+                className="ml-2 align-middle"
+                style={{ width: 180 }}
+              />{" "}
+              <span>{sunElevation}</span>
+            </label>
+            <div className="text-[0.75em] opacity-85">
+              Fog ∝ dot(view, sun): look toward sun = more fog
+            </div>
+          </>
+        )}
+        <label className="mb-1.5 flex items-center gap-2">
+          <input
+            type="checkbox"
             checked={debugMode}
             onChange={(e) => setDebugMode(e.target.checked)}
           />
           <span>debug: color by T (blue=high, red=low)</span>
         </label>
         <div className="mt-2 border-t border-white/20 pt-2 text-[0.78em] opacity-80">
-          Beer–Lambert law: T(d) = exp(−β d). At 5m:{" "}
-          <span>{Math.exp(-beta * 5).toFixed(3)}</span>, at 20m:{" "}
-          <span>{Math.exp(-beta * 20).toFixed(3)}</span>
+          {volumetricMode
+            ? "Volumetric: σ ∝ height × patch × (1 + dot(view,sun))"
+            : "Beer–Lambert (constant): T(d) = exp(−β d). At 5m: " +
+              Math.exp(-beta * 5).toFixed(3) +
+              ", 20m: " +
+              Math.exp(-beta * 20).toFixed(3)}
         </div>
         <div className="mt-1.5 text-[0.82em] opacity-75">
           WASD orbit/zoom · arrows pan & rotate · mouse drag to look
@@ -120,6 +255,12 @@ type SceneProps = {
   beta: number;
   snowCount: number;
   debugMode: boolean;
+  volumetricMode: boolean;
+  patchScale: number;
+  patchAmount: number;
+  noiseSeed: number;
+  sunAzimuth: number;
+  sunElevation: number;
 };
 
 const FOG_COUNT = FOG_GRID_X * FOG_GRID_Y * FOG_GRID_Z;
@@ -174,7 +315,19 @@ function KeyboardHandler({
   return null;
 }
 
-const Scene = ({ beta, snowCount, debugMode }: SceneProps) => {
+const FOG_SCALE_HEIGHT = 4; // vertical scale for ground fog σ(y)∝exp(-y/H)
+
+const Scene = ({
+  beta,
+  snowCount,
+  debugMode,
+  volumetricMode,
+  patchScale,
+  patchAmount,
+  noiseSeed,
+  sunAzimuth,
+  sunElevation,
+}: SceneProps) => {
   const renderer = useThree((state) => state.gl);
   const camera = useThree((state) => state.camera);
   const scene = useThree((state) => state.scene);
@@ -198,27 +351,73 @@ const Scene = ({ beta, snowCount, debugMode }: SceneProps) => {
   useEffect(() => {
     meshRef.current?.updateVersion();
     snowMeshRef.current?.updateVersion();
-  }, [beta, debugMode]);
+  }, [beta, debugMode, volumetricMode, patchScale, patchAmount, noiseSeed, sunAzimuth, sunElevation]);
 
   // Fog dyno uniforms (shared by scene and snow)
   const fogUniforms = useMemo(() => {
     const uBeta = dyno.dynoFloat(BETA_INIT);
     const uFogColor = dyno.dynoVec3(FOG_COLOR.clone());
     const uDebugMode = dyno.dynoBool(false);
-    return { uBeta, uFogColor, uDebugMode };
+    const uVolumetricMode = dyno.dynoBool(false);
+    const uFogScaleHeight = dyno.dynoFloat(FOG_SCALE_HEIGHT);
+    const uPatchScale = dyno.dynoFloat(PATCH_SCALE_INIT);
+    const uPatchAmount = dyno.dynoFloat(PATCH_AMOUNT_INIT);
+    const uNoiseSeed = dyno.dynoVec3(
+      new THREE.Vector3(0, 0, 0),
+    );
+    const uSunDir = dyno.dynoVec3(
+      sunDirFromAngles(SUN_AZIMUTH_INIT, SUN_ELEVATION_INIT),
+    );
+    return {
+      uBeta,
+      uFogColor,
+      uDebugMode,
+      uVolumetricMode,
+      uFogScaleHeight,
+      uPatchScale,
+      uPatchAmount,
+      uNoiseSeed,
+      uSunDir,
+    };
   }, []);
 
   // Sync uniforms
   fogUniforms.uBeta.value = beta;
   fogUniforms.uDebugMode.value = debugMode;
+  fogUniforms.uVolumetricMode.value = volumetricMode;
+  fogUniforms.uFogScaleHeight.value = FOG_SCALE_HEIGHT;
+  fogUniforms.uPatchScale.value = patchScale;
+  fogUniforms.uPatchAmount.value = patchAmount;
+  fogUniforms.uNoiseSeed.value.set(
+    noiseSeed,
+    noiseSeed * 1.37,
+    noiseSeed * 2.1,
+  );
+  fogUniforms.uSunDir.value.copy(
+    sunDirFromAngles(sunAzimuth, sunElevation),
+  );
 
   const makeFogModifier = useCallback(
     (mesh: SparkSplatMesh) => {
       mesh.enableViewToWorld = true;
       const camPos = mesh.context.viewToWorld.translate;
-      const { uBeta, uFogColor, uDebugMode } = fogUniforms;
+      const {
+        uBeta,
+        uFogColor,
+        uDebugMode,
+        uVolumetricMode,
+        uFogScaleHeight,
+        uPatchScale,
+        uPatchAmount,
+        uNoiseSeed,
+        uSunDir,
+      } = fogUniforms;
       const colorRed = dyno.dynoConst("vec3", new THREE.Vector3(1, 0, 0));
       const colorBlue = dyno.dynoConst("vec3", new THREE.Vector3(0, 0, 1));
+      const one = dyno.dynoConst("float", 1.0);
+      const zero = dyno.dynoConst("float", 0.0);
+      const N_STEPS = 8;
+
       return dyno.dynoBlock(
         { gsplat: dyno.Gsplat },
         { gsplat: dyno.Gsplat },
@@ -226,19 +425,59 @@ const Scene = ({ beta, snowCount, debugMode }: SceneProps) => {
           if (!gsplat) return { gsplat };
           const { center, rgb, opacity } = dyno.splitGsplat(gsplat).outputs;
           const dist = dyno.distance(center, camPos);
-          const T = dyno.exp(dyno.neg(dyno.mul(uBeta, dist)));
-          const one = dyno.dynoConst("float", 1.0);
-          // absorption = (1 - T)
+          const stepSize = dyno.div(dist, dyno.dynoConst("float", N_STEPS));
+
+          // Constant Beer–Lambert: T = exp(-β d)
+          const T_constant = dyno.exp(dyno.neg(dyno.mul(uBeta, dist)));
+
+          // Volumetric: T = exp(-τ), τ = ∫σ ds
+          // σ = height × patch × (1 + max(0, dot(viewDir, sunDir)))
+          // Purely geometric: viewDir from camera, sunDir from sun position
+          const up = dyno.dynoConst("vec3", new THREE.Vector3(0, 1, 0));
+          const viewDir = dyno.normalize(dyno.sub(center, camPos));
+          const dotSun = dyno.dot(viewDir, uSunDir);
+          const dotSunClamped = dyno.max(dotSun, zero);
+          const viewSunFactor = dyno.add(one, dotSunClamped);
+          let tau = dyno.add(zero, zero);
+          for (let i = 0; i < N_STEPS; i++) {
+            const t = (i + 0.5) / N_STEPS;
+            const pos = dyno.mix(camPos, center, dyno.dynoConst("float", t));
+            const y = dyno.dot(pos, up);
+            const ySafe = dyno.max(y, zero);
+            const sigmaHeight = dyno.mul(
+              uBeta,
+              dyno.exp(dyno.neg(dyno.div(ySafe, uFogScaleHeight))),
+            );
+            // Patchy: hash(pos/scale + seed) gives 0–1, factor = 1 ± amount
+            const scaledPos = dyno.add(
+              dyno.div(pos, uPatchScale),
+              uNoiseSeed,
+            );
+            const noiseVal = dyno.hashFloat(scaledPos);
+            const half = dyno.dynoConst("float", 0.5);
+            const patchFactor = dyno.add(
+              one,
+              dyno.mul(
+                dyno.sub(noiseVal, half),
+                dyno.mul(uPatchAmount, dyno.dynoConst("float", 2)),
+              ),
+            );
+            const sigma = dyno.mul(
+              dyno.mul(sigmaHeight, patchFactor),
+              viewSunFactor,
+            );
+            tau = dyno.add(tau, dyno.mul(sigma, stepSize));
+          }
+          const T_volumetric = dyno.exp(dyno.neg(tau));
+          const T = dyno.select(uVolumetricMode, T_volumetric, T_constant);
+
           const absorption = dyno.sub(one, T);
-          // color: C_fog + C_splat = (1-T)·c_fog + T·c_splat
           const normalRgb = dyno.add(
             dyno.mul(uFogColor, absorption),
             dyno.mul(rgb, T),
           );
-          // debug: blue = high T, red = low T
           const debugRgb = dyno.mix(colorRed, colorBlue, T);
           const newRgb = dyno.select(uDebugMode, debugRgb, normalRgb);
-          // alpha: respecting existing opacity
           const newAlpha = dyno.sub(
             one,
             dyno.mul(T, dyno.sub(one, opacity)),
@@ -439,7 +678,6 @@ const Scene = ({ beta, snowCount, debugMode }: SceneProps) => {
         const cx = camera.position.x;
         const cy = camera.position.y;
         const cz = camera.position.z;
-        const beta = betaRef.current;
         const yMin = cy - SNOW_BOX_Y_BELOW;
         const yMax = cy + SNOW_BOX_Y_ABOVE;
         const xMin = cx - SNOW_BOX_XZ;
@@ -473,12 +711,6 @@ const Scene = ({ beta, snowCount, debugMode }: SceneProps) => {
           snowPos[i * 3 + 0] = px;
           snowPos[i * 3 + 1] = py;
           snowPos[i * 3 + 2] = pz;
-          const dx = px - cx;
-          const dy = py - cy;
-          const dz = pz - cz;
-          const d = Math.sqrt(dx * dx + dy * dy + dz * dz);
-          const T = Math.exp(-beta * d);
-          const alpha = snowOpac[i] * T;
           _sc.set(px, py, pz);
           _ss.set(snowScl[i * 3], snowScl[i * 3 + 1], snowScl[i * 3 + 2]);
           _sq.set(
@@ -487,12 +719,9 @@ const Scene = ({ beta, snowCount, debugMode }: SceneProps) => {
             snowQuat[i * 4 + 2],
             snowQuat[i * 4 + 3],
           );
-          _scol.setRGB(
-            snowColR[i] * T + FOG_COLOR.x * (1 - T),
-            snowColG[i] * T + FOG_COLOR.y * (1 - T),
-            snowColB[i] * T + FOG_COLOR.z * (1 - T),
-          );
-          mesh.packedSplats.setSplat(i, _sc, _ss, _sq, alpha, _scol);
+          // Pass base opacity and color; worldModifier (makeFogModifier) applies fog
+          _scol.setRGB(snowColR[i], snowColG[i], snowColB[i]);
+          mesh.packedSplats.setSplat(i, _sc, _ss, _sq, snowOpac[i], _scol);
         }
         mesh.packedSplats.numSplats = activeSnowCount;
         mesh.numSplats = activeSnowCount;
@@ -575,6 +804,21 @@ const Scene = ({ beta, snowCount, debugMode }: SceneProps) => {
         <SplatMesh ref={snowMeshRef} args={[snowMeshArgs]} />
         <SplatMesh ref={fogMeshRef} args={[fogMeshArgs]} />
       </SparkRenderer>
+      {/* Sun indicator: explicit position for teaching view-direction anisotropy */}
+      {volumetricMode && (
+        <mesh
+          position={sunDirFromAngles(sunAzimuth, sunElevation).multiplyScalar(
+            SUN_DISTANCE,
+          )}
+        >
+          <sphereGeometry args={[0.8, 16, 16]} />
+          <meshBasicMaterial
+            color="#fffacd"
+            transparent
+            opacity={0.95}
+          />
+        </mesh>
+      )}
     </>
   );
 };
