@@ -41,11 +41,12 @@ function makeRNG(seed: number) {
 function App() {
   const [beta, setBeta] = useState(BETA_INIT);
   const [snowCount, setSnowCount] = useState(SNOW_COUNT_INIT);
+  const [debugMode, setDebugMode] = useState(false);
 
   return (
     <div className="relative flex h-screen w-screen">
       <Canvas gl={{ antialias: false }}>
-        <Scene beta={beta} snowCount={snowCount} />
+        <Scene beta={beta} snowCount={snowCount} debugMode={debugMode} />
       </Canvas>
       {/* Sliders overlay */}
       <div
@@ -82,6 +83,14 @@ function App() {
           />{" "}
           <span>{snowCount}</span> flakes
         </label>
+        <label className="mb-1.5 flex items-center gap-2">
+          <input
+            type="checkbox"
+            checked={debugMode}
+            onChange={(e) => setDebugMode(e.target.checked)}
+          />
+          <span>debug: color by T (blue=high, red=low)</span>
+        </label>
         <div className="mt-2 border-t border-white/20 pt-2 text-[0.8em] opacity-80">
           <div className="mb-0.5 font-medium">
             Transmittance T(d) = exp(−βd)
@@ -111,9 +120,10 @@ function App() {
 type SceneProps = {
   beta: number;
   snowCount: number;
+  debugMode: boolean;
 };
 
-const Scene = ({ beta, snowCount }: SceneProps) => {
+const Scene = ({ beta, snowCount, debugMode }: SceneProps) => {
   const renderer = useThree((state) => state.gl);
   const camera = useThree((state) => state.camera);
   const scene = useThree((state) => state.scene);
@@ -122,27 +132,31 @@ const Scene = ({ beta, snowCount }: SceneProps) => {
   const snowCountRef = useRef(snowCount);
   snowCountRef.current = snowCount;
 
-  // Force fog generators to re-run when beta changes (otherwise they only run on camera move)
+  // Force fog generators to re-run when beta or debugMode changes
   useEffect(() => {
     meshRef.current?.updateVersion();
     snowMeshRef.current?.updateVersion();
-  }, [beta]);
+  }, [beta, debugMode]);
 
   // Fog dyno uniforms (shared by scene and snow)
   const fogUniforms = useMemo(() => {
     const uBeta = dyno.dynoFloat(BETA_INIT);
     const uFogColor = dyno.dynoVec3(FOG_COLOR.clone());
-    return { uBeta, uFogColor };
+    const uDebugMode = dyno.dynoBool(false);
+    return { uBeta, uFogColor, uDebugMode };
   }, []);
 
-  // Sync beta to dyno uniform
+  // Sync uniforms
   fogUniforms.uBeta.value = beta;
+  fogUniforms.uDebugMode.value = debugMode;
 
   const makeFogModifier = useCallback(
     (mesh: SparkSplatMesh) => {
       mesh.enableViewToWorld = true;
       const camPos = mesh.context.viewToWorld.translate;
-      const { uBeta, uFogColor } = fogUniforms;
+      const { uBeta, uFogColor, uDebugMode } = fogUniforms;
+      const colorRed = dyno.dynoConst("vec3", new THREE.Vector3(1, 0, 0));
+      const colorBlue = dyno.dynoConst("vec3", new THREE.Vector3(0, 0, 1));
       return dyno.dynoBlock(
         { gsplat: dyno.Gsplat },
         { gsplat: dyno.Gsplat },
@@ -155,10 +169,13 @@ const Scene = ({ beta, snowCount }: SceneProps) => {
           // absorption = (1 - T)
           const absorption = dyno.sub(one, T);
           // color: C_fog + C_splat = (1-T)·c_fog + T·c_splat
-          const newRgb = dyno.add(
+          const normalRgb = dyno.add(
             dyno.mul(uFogColor, absorption),
             dyno.mul(rgb, T),
           );
+          // debug: blue = high T, red = low T
+          const debugRgb = dyno.mix(colorRed, colorBlue, T);
+          const newRgb = dyno.select(uDebugMode, debugRgb, normalRgb);
           // alpha: same idea but respecting existing opacity
           const newAlpha = dyno.sub(
             one,
